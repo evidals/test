@@ -1,0 +1,239 @@
+/**
+ * ESP32 Deadlock Demo - Timeout
+ * 
+ * Demonstrate why kernel object timeouts are important to alleviate
+ * deadlock. Note that this still can cause "livelock."
+ * 
+ * Date: February 8, 2021
+ * Original Author: Shawn Hymel
+ * Adapted by: Enrique Vidal, 13.07.2021
+ * License: 0BSD
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include <esp32/rom/uart.h>
+#include "soc/rtc_wdt.h"
+#include "esp_task_wdt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+#include "freertos/semphr.h"
+#include "driver/adc.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "driver/timer.h"
+#include "sdkconfig.h"
+
+#if CONFIG_FREERTOS_UNICORE
+static const BaseType_t app_cpu = 0;
+#else
+static const BaseType_t app_cpu = 1;
+#endif
+
+#define LOW 0
+#define HIGH 1
+
+#define BUF_SIZE (1024)
+
+#define ECHO_TEST_TXD (CONFIG_EXAMPLE_UART_TXD)
+#define ECHO_TEST_RXD (CONFIG_EXAMPLE_UART_RXD)
+#define ECHO_TEST_RTS (UART_PIN_NO_CHANGE)
+#define ECHO_TEST_CTS (UART_PIN_NO_CHANGE)
+
+#define ECHO_UART_PORT_NUM      (CONFIG_EXAMPLE_UART_PORT_NUM)
+#define ECHO_UART_BAUD_RATE     (CONFIG_EXAMPLE_UART_BAUD_RATE)
+#define ECHO_TASK_STACK_SIZE    (CONFIG_EXAMPLE_TASK_STACK_SIZE)
+
+#define UART_OTHER_MESSAGES 6
+#define UART_USER_MESSAGES 7
+#define UART_WARNING_MESSAGES 2
+#define UART_COMMAND_MESSAGES 3
+
+/*
+ * Macro to check the outputs of TWDT functions and trigger an abort if an
+ * incorrect code is returned.
+ */
+#define CHECK_ERROR_CODE(returned, expected) ({                        \
+            if(returned != expected){                                  \
+                printf("TWDT ERROR\n");                                \
+                abort();                                               \
+            }                                                          \
+})
+
+//Time TickTypes definitions
+static const TickType_t cs_wait = 250;   // Time spent in critical section (ms)
+static const TickType_t med_wait = 5000; // Time medium task spends working (ms)
+//NOTE THAT I WILL USE THE xDelay since they are a better approach 
+//(because you dont need to make multiplications)
+static const TickType_t xDelay250ms = pdMS_TO_TICKS(250);
+static const TickType_t xDelay5000ms = pdMS_TO_TICKS(5000);
+static portMUX_TYPE xMySpinLock = portMUX_INITIALIZER_UNLOCKED;
+
+
+/************ TASKS **********/
+/**
+ * @brief Task H (High priority)
+ */
+void doTaskH(void *parameters)
+{
+    static TickType_t timestamp;
+    static volatile  TickType_t xTimeNow_H;
+     // Do forever
+    for ( ;; )
+    {
+        // Take lock
+        ets_printf("Task H trying to take lock...\n");
+        timestamp = xTaskGetTickCount();
+        taskENTER_CRITICAL(&xMySpinLock);
+        // Say how long we spend waiting for a lock
+        xTimeNow_H =xTaskGetTickCount() - timestamp;
+        ets_printf("Task H got lock. Spent %lu *10 [ms]",(unsigned long)xTimeNow_H);
+        ets_printf(" waiting for lock.\nTask H Doing some work...\n");
+
+        // Hog the processor for a while doing nothing
+        timestamp = xTaskGetTickCount();
+        xTimeNow_H =xTaskGetTickCount();
+
+        while (xTimeNow_H - timestamp < xDelay250ms)
+        {
+            xTimeNow_H = xTaskGetTickCount();
+        }
+        
+        ets_printf("Task H releasing lock.\n");
+        taskEXIT_CRITICAL(&xMySpinLock);
+        
+        // Go to sleep
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+
+/**
+ * @brief Task M (Medium priority)
+ */
+void doTaskM(void *parameters)
+{
+    static TickType_t timestamp;
+    static volatile TickType_t xTimeNow_M;
+     // Do forever
+    for ( ;; )
+    {
+        // Hog the processor for a while doing nothing
+        ets_printf("Task M doing some work...\n");
+        timestamp = xTaskGetTickCount();
+        //vTaskDelay(0);
+        xTimeNow_M = xTaskGetTickCount();
+
+        while ( xTimeNow_M - timestamp < xDelay5000ms)
+        {
+            xTimeNow_M = xTaskGetTickCount();
+            //ets_printf("\n xTimeNow_M =%lu [ticks]",(unsigned long)xTimeNow_M); 
+        }
+        // Go to sleep
+        ets_printf("Task M done!\n");
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+
+/**
+ * @brief Task L (low priority)
+ */
+void doTaskL(void *parameters) 
+{
+    static TickType_t timestamp;
+    static volatile TickType_t xTimeNow_L;  
+    
+    // Do forever
+    for ( ;; )
+    { // Take lock
+        printf("Task L trying to take lock...\n");
+        timestamp = xTaskGetTickCount(); // in ticks
+        taskENTER_CRITICAL(&xMySpinLock);
+        
+        // Say how long we spend waiting for a lock
+        xTimeNow_L =xTaskGetTickCount() - timestamp;
+        ets_printf("Task L got lock. Spent %lu *10 ms",(unsigned long)(xTimeNow_L));
+        ets_printf(" waiting for lock.\nL-Doing some work ... \n");
+
+        // Hog the processor for a while doing nothing
+        timestamp = xTaskGetTickCount();
+        xTimeNow_L  = xTaskGetTickCount();
+        
+        while ( xTimeNow_L - timestamp < xDelay250ms)
+        {
+            xTimeNow_L = xTaskG etTickCount();
+            //ets_printf("\n xTimeNow_L =%lu [ticks]",(unsigned long)xTimeNow_L);
+        }
+
+        // Release lock
+        ets_printf("Task L releasing lock.\n");
+        taskEXIT_CRITICAL(&xMySpinLock);
+        //xSemaphoreGive(lock);
+
+        // Go to sleep
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+}
+
+/***********END TASKS*******************/
+
+/**
+ * @brief Main UART Setup Function. Initialize the UART-0.
+ */
+void vSetupUART(void)
+{
+    /* Configure parameters of an UART driver,
+     * communication pins and install the driver */
+    uart_config_t uart_config = {
+        .baud_rate = ECHO_UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+    int intr_alloc_flags = 0;
+
+#if CONFIG_UART_ISR_IN_IRAM
+    intr_alloc_flags = ESP_INTR_FLAG_IRAM;
+#endif
+
+    ESP_ERROR_CHECK(uart_driver_install(ECHO_UART_PORT_NUM, BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
+    ESP_ERROR_CHECK(uart_param_config(ECHO_UART_PORT_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, ECHO_TEST_TXD, ECHO_TEST_RXD, ECHO_TEST_RTS, ECHO_TEST_CTS));
+    
+    //setupUARTmessages(); // Create the UART messages, not relevant for the test.
+}
+
+void vPrintInitalTimeValues(void)
+{
+    TickType_t portTickP_MS= portTICK_PERIOD_MS;
+    printf("cs_wait = %lu\n",(unsigned long)cs_wait);
+    printf("xDelay250ms = %lu\n",(unsigned long)xDelay250ms);
+    printf("med_wait = %lu\n",(unsigned long)med_wait);
+    printf("xDelay5000ms = %lu\n",(unsigned long)xDelay5000ms);
+    printf("portTickP_MS = %lu\n",(unsigned long)portTickP_MS);
+}
+
+/**
+ * @brief MAIN THREAD
+ */
+void app_main(void)
+{
+    vTaskDelay(1200 / portTICK_PERIOD_MS); // Wait a bit in order to plot all info from the uC
+    vSetupUART();
+    vTaskDelay(60 / portTICK_PERIOD_MS); // Wait a bit in order to plot all info from the uC
+    vPrintInitalTimeValues();
+
+    // Start Task L (low priority)
+    xTaskCreatePinnedToCore(doTaskL,"Task L",2048, NULL,1,NULL,app_cpu);
+    // Introduce a delay to force priority inversion
+    vTaskDelay(10 / portTICK_PERIOD_MS); 
+    // Start Task H (high priority)
+    xTaskCreatePinnedToCore(doTaskH,"Task H",2048,NULL,3,NULL,app_cpu);
+    // Start Task M (medium priority)
+    xTaskCreatePinnedToCore(doTaskM,"Task M",2048,NULL,2,NULL,app_cpu);
+    //xTaskCreatePinnedToCore(theLoop,"Loop", 2048, NULL,3, NULL, 1);
+    vTaskDelete(NULL);
+}

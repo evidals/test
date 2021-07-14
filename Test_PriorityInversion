@@ -1,12 +1,8 @@
 /**
- * ESP32 Deadlock Demo - Timeout
- * 
- * Demonstrate why kernel object timeouts are important to alleviate
- * deadlock. Note that this still can cause "livelock."
- * 
+ * ESP32 PriorityInversion
  * Date: February 8, 2021
  * Original Author: Shawn Hymel
- * Adapted by: Enrique Vidal, 13.07.2021
+ * Adapted by: Enrique Vidal, 14.07.2021
  * License: 0BSD
  */
 
